@@ -1059,7 +1059,11 @@ class PeftTrainer(abstract_trainer.AbstractTrainer):
   @override
   def fwd_bwd(self, payload: datatypes.TrainerPayload | Any, **kwargs) -> None:
     """Executes forward and backward passes."""
-    fwd_bwd_step, _, _ = self.jit_fwd_bwd_update_and_eval_step()
+    cache_nnx_graph = kwargs.pop("cache_nnx_graph", True)
+    skip_jit = kwargs.pop("skip_jit", False)
+    fwd_bwd_step, _, _ = self.jit_fwd_bwd_update_and_eval_step(
+        skip_jit, cache_nnx_graph
+    )
     self._record_fwd_bwd(
         *fwd_bwd_step(
             grad_accumulator=self.grad_accumulator,
@@ -1070,7 +1074,11 @@ class PeftTrainer(abstract_trainer.AbstractTrainer):
   @override
   def update(self, **kwargs) -> int:
     """Applies the accumulated gradients."""
-    _, update_step, _ = self.jit_fwd_bwd_update_and_eval_step()
+    cache_nnx_graph = kwargs.pop("cache_nnx_graph", True)
+    skip_jit = kwargs.pop("skip_jit", False)
+    _, update_step, _ = self.jit_fwd_bwd_update_and_eval_step(
+        skip_jit, cache_nnx_graph
+    )
     return self._record_update(update_step())
 
   def train_step(
@@ -1084,7 +1092,9 @@ class PeftTrainer(abstract_trainer.AbstractTrainer):
     available in the single-microstep regime; when accumulating there is work
     between the two halves, so they must stay separate.
     """
-    self.jit_fwd_bwd_update_and_eval_step()
+    cache_nnx_graph = kwargs.pop("cache_nnx_graph", True)
+    skip_jit = kwargs.pop("skip_jit", False)
+    self.jit_fwd_bwd_update_and_eval_step(skip_jit, cache_nnx_graph)
     if self._jitted_train_step_fn is None:
       raise ValueError(
           "train_step() requires exactly one micro-batch per update. Use"
