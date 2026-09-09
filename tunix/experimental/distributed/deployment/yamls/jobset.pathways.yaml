@@ -16,11 +16,12 @@ apiVersion: jobset.x-k8s.io/v1alpha2
 kind: JobSet
 metadata:
   name: ${JOBSET_NAME}
-  namespace: default
-spec:
+  namespace: ${NAMESPACE}
+${QUEUE_LABEL}spec:
   coordinator:
     replicatedJob: proc
   failurePolicy:
+    maxRestarts: 3
     restartStrategy: Recreate
   network:
     enableDNSHostnames: true
@@ -177,6 +178,12 @@ spec:
                 value: "grpc://localhost:29000"
               - name: VLLM_ENABLE_V1_MULTIPROCESSING
                 value: "0"
+              - name: HF_TOKEN
+                valueFrom:
+                  secretKeyRef:
+                    name: ${HF_TOKEN_SECRET_NAME}
+                    key: HF_TOKEN
+                    optional: true
               ports:
               - containerPort: ${USER_CONTAINER_PORT}
                 name: grpc # Naming it 'grpc' tells GKE to optimize for HTTP/2

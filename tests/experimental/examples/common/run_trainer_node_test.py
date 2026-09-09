@@ -441,6 +441,9 @@ class RunTrainerNodeMainAndShutdownTest(absltest.TestCase):
     self.assertEqual(args.checkpoint_save_interval_steps, 1)
     self.assertEqual(args.checkpoint_max_to_keep, 10)
     self.assertFalse(args.use_lora)
+    self.assertEqual(args.rollout_mesh_tp, 0)
+    self.assertTrue(args.prefuse_moe_weights)
+    self.assertTrue(args.use_weight_converter)
 
     custom_argv = [
         "--port",
@@ -453,6 +456,10 @@ class RunTrainerNodeMainAndShutdownTest(absltest.TestCase):
         "4",
         "--mesh_tp",
         "2",
+        "--rollout_mesh_tp",
+        "8",
+        "--prefuse_moe_weights=false",
+        "--use_weight_converter=false",
         "--checkpoint_save_interval_steps",
         "5",
         "--checkpoint_max_to_keep",
@@ -471,12 +478,21 @@ class RunTrainerNodeMainAndShutdownTest(absltest.TestCase):
     self.assertEqual(args_custom.model_name, "Qwen3-32B")
     self.assertEqual(args_custom.mesh_fsdp, 4)
     self.assertEqual(args_custom.mesh_tp, 2)
+    self.assertEqual(args_custom.rollout_mesh_tp, 8)
+    self.assertFalse(args_custom.prefuse_moe_weights)
+    self.assertFalse(args_custom.use_weight_converter)
     self.assertEqual(args_custom.checkpoint_save_interval_steps, 5)
     self.assertEqual(args_custom.checkpoint_max_to_keep, 3)
     self.assertEqual(args_custom.checkpoint_root_directory, "/checkpoints/test")
     self.assertTrue(args_custom.use_lora)
     self.assertEqual(args_custom.lora_rank, 32)
     self.assertEqual(args_custom.lora_alpha, 64.0)
+
+  def test_parse_args_bare_boolean_flags(self):
+    argv = ["--prefuse_moe_weights", "--use_weight_converter"]
+    args = run_trainer_node._parse_args(argv)
+    self.assertTrue(args.prefuse_moe_weights)
+    self.assertTrue(args.use_weight_converter)
 
   def test_create_mesh_validates_device_count(self):
     args = mock.MagicMock(mesh_fsdp=2, mesh_tp=2)
