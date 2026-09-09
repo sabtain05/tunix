@@ -50,27 +50,6 @@ DEFAULT_MODEL_DOWNLOAD_DIR = os.path.join(
 )
 
 
-def _build_actor_optimizer(args):
-  """Builds the actor optimizer from CLI flags.
-
-  Defaults reproduce the previous bare optax.adamw (no clipping, optax defaults
-  b2=0.999 / weight_decay=0.0).
-
-  TODO(tunix-dev): replace these individual flags with a structured actor
-  optimizer config (opt_type / schedule / b1 / b2 / weight_decay /
-  max_grad_norm) matching optimizer creation in cli.
-  """
-  adamw = optax.adamw(
-      learning_rate=args.learning_rate,
-      b1=args.adam_b1,
-      b2=args.adam_b2,
-      weight_decay=args.weight_decay,
-  )
-  if args.max_grad_norm is not None:
-    return optax.chain(optax.clip_by_global_norm(args.max_grad_norm), adamw)
-  return adamw
-
-
 def _parse_args(argv: list[str]) -> argparse.Namespace:
   parser = argparse.ArgumentParser(description="JAX trainer worker process")
   parser.add_argument("--port", type=int, default=20000)
@@ -91,16 +70,32 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
   parser.add_argument("--mesh_expert", type=int, default=1)
   parser.add_argument("--max_prompt_length", type=int, default=512)
   parser.add_argument("--max_response_length", type=int, default=128)
-  parser.add_argument("--mini_batch_size", type=int, default=1)
-  parser.add_argument("--train_micro_batch_size", type=int, default=1)
+  parser.add_argument(
+      "--mini_batch_size",
+      type=int,
+      default=1,
+      help="Number of prompt groups per optimizer update.",
+  )
+  parser.add_argument(
+      "--num_generations",
+      type=int,
+      default=1,
+      help="Number of rollout trajectories generated per prompt group.",
+  )
+  parser.add_argument(
+      "--train_micro_batch_size",
+      type=int,
+      default=1,
+      help="Number of trajectories per forward/backward microbatch.",
+  )
   parser.add_argument("--compute_logps_micro_batch_size", type=int, default=1)
   parser.add_argument("--compute_logps_chunk_size", type=int, default=0)
   parser.add_argument("--eval_every_n_steps", type=int, default=1000000)
   parser.add_argument("--learning_rate", type=float, default=2.0e-7)
-  parser.add_argument("--max_grad_norm", type=float, default=None)
   parser.add_argument("--adam_b1", type=float, default=0.9)
   parser.add_argument("--adam_b2", type=float, default=0.999)
-  parser.add_argument("--weight_decay", type=float, default=0.0)
+  parser.add_argument("--weight_decay", type=float, default=1.0e-4)
+  parser.add_argument("--max_grad_norm", type=float, default=None)
   parser.add_argument("--use_lora", action="store_true")
   parser.add_argument("--lora_rank", type=int, default=64)
   parser.add_argument("--lora_alpha", type=float, default=64.0)
@@ -367,9 +362,31 @@ def _create_maxtext_trainer_factory(args) -> Any:
   return _factory
 
 
+def _gradient_accumulation_steps(args: argparse.Namespace) -> int:
+  if args.mini_batch_size <= 0:
+    raise ValueError("--mini_batch_size must be positive.")
+  if args.num_generations <= 0:
+    raise ValueError("--num_generations must be positive.")
+  if args.train_micro_batch_size <= 0:
+    raise ValueError("--train_micro_batch_size must be positive.")
+  update_trajectories = args.mini_batch_size * args.num_generations
+  if update_trajectories % args.train_micro_batch_size != 0:
+    raise ValueError(
+        "--mini_batch_size * --num_generations must be divisible by "
+        "--train_micro_batch_size; got "
+        f"mini_batch_size={args.mini_batch_size}, "
+        f"num_generations={args.num_generations}, "
+        f"train_micro_batch_size={args.train_micro_batch_size}."
+    )
+  return update_trajectories // args.train_micro_batch_size
+
+
 def _create_tunix_trainer_factory(args) -> Any:
   """Creates the trainer factory function for Tunix's PeftTrainer."""
   logging.info("Trainer backend: Tunix's PeftTrainer.")
+  grad_accumulation_steps = _gradient_accumulation_steps(args)
+  update_trajectories = args.mini_batch_size * args.num_generations
+
   args.model_dir = _ensure_model_dir_for_trainer(args.model_dir, args.model_id)
   logging.info("Prepared trainer safetensors directory: %s", args.model_dir)
 
@@ -381,9 +398,6 @@ def _create_tunix_trainer_factory(args) -> Any:
   actor_model = _load_actor_model(args, mesh, lora=args.use_lora)
 
   logging.info("Building PeftTrainer v2 config...")
-  grad_accumulation_steps = max(
-      1, math.ceil(args.mini_batch_size / args.train_micro_batch_size)
-  )
   checkpointing_options = ocp.CheckpointManagerOptions(
       save_interval_steps=args.checkpoint_save_interval_steps,
       max_to_keep=args.checkpoint_max_to_keep,
@@ -402,21 +416,43 @@ def _create_tunix_trainer_factory(args) -> Any:
       resume_from_checkpoint_on_init=False,
   )
   logging.info(
-      "PeftTrainer v2 gradient_accumulation_steps=%d.",
+      "PeftTrainer v2 gradient_accumulation_steps=%d "
+      "(mini_batch_size=%d prompt groups, num_generations=%d, "
+      "update_trajectories=%d, train_micro_batch_size=%d).",
       grad_accumulation_steps,
+      args.mini_batch_size,
+      args.num_generations,
+      update_trajectories,
+      args.train_micro_batch_size,
   )
 
   def _factory():
+    optimizer = _build_optimizer(args)
     with mesh:
       trainer = peft_trainer_v2.PeftTrainer(
           actor_model,
-          _build_actor_optimizer(args),
+          optimizer,
           training_config,
           sampler_type=args.sampler_type,
       )
     return _MeshBoundTrainer(trainer, mesh)
 
   return _factory
+
+
+def _build_optimizer(args: argparse.Namespace) -> optax.GradientTransformation:
+  optimizer = optax.adamw(
+      learning_rate=args.learning_rate,
+      b1=args.adam_b1,
+      b2=args.adam_b2,
+      weight_decay=args.weight_decay,
+  )
+  if args.max_grad_norm is not None:
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(args.max_grad_norm),
+        optimizer,
+    )
+  return optimizer
 
 
 def _create_trainer_factory(args) -> Any:
@@ -450,6 +486,12 @@ def main(argv: list[str], context: Any = None) -> None:
 
   if args.train_micro_batch_size <= 0:
     raise ValueError("--train_micro_batch_size must be positive.")
+  if args.mini_batch_size <= 0:
+    raise ValueError("--mini_batch_size must be positive.")
+  if args.num_generations <= 0:
+    raise ValueError("--num_generations must be positive.")
+  if args.max_grad_norm is not None and args.max_grad_norm <= 0:
+    raise ValueError("--max_grad_norm must be positive when specified.")
 
   logging.info("Creating generic TrainerWorker and gRPC server...")
   trainer_factory = _create_trainer_factory(args)
