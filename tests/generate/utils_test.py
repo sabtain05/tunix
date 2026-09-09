@@ -1070,6 +1070,48 @@ class UtilsTest(parameterized.TestCase):
         dst_state['untouched_variable'][...], jnp.array(-1)
     )
 
+  def test_transfer_state_directly_with_flat_state(self):
+    """Tests transfer_state_directly with an object exposing flat_state."""
+    class FakeFlatStateModel:
+
+      def __init__(self, state_dict):
+        self._state = state_dict
+
+      def flat_state(self):
+        # Return path tuples with integer indices to verify int-to-str normalization
+        return [
+            (('layers', 0, 'weight'), self._state['layers']['0']['weight']),
+            (('layers', 0, 'bias'), self._state['layers']['0']['bias']),
+        ]
+
+    param_w = MockParam(jnp.zeros((2, 2)))
+    param_b = MockParam(jnp.zeros((2,)))
+    dst_state = FakeFlatStateModel({
+        'layers': {'0': {'weight': param_w, 'bias': param_b}}
+    })
+
+    src_state = {
+        'layers': {
+            '0': {
+                'weight': jnp.ones((2, 2)),
+                'bias': jnp.array([1.0, 2.0]),
+                'extra_unused': jnp.zeros((1,)),
+            }
+        }
+    }
+
+    mock_reshard = lambda source, target: source
+    with self.assertLogs(level='WARNING') as cm:
+      utils.transfer_state_directly(
+          src_state, dst_state, reshard_fn=mock_reshard
+      )
+
+    np.testing.assert_array_equal(param_w.value, jnp.ones((2, 2)))
+    np.testing.assert_array_equal(param_b.value, jnp.array([1.0, 2.0]))
+    self.assertTrue(
+        any('unmatched into dst_state.flat_state' in msg for msg in cm.output)
+    )
+
   def test_attention_weight_num_heads_repetition_and_rank_alignment(self):
     """Test repeating num_heads dimension (non-last axis) for attention weights."""
     # Source k_proj: (model_dim=16, num_heads=2, head_dim=128)
@@ -2249,6 +2291,63 @@ class ResolveParallelismSizesTest(parameterized.TestCase):
         jnp.ones((4, 8), dtype=jnp.float32),
     )
 
+  def test_interleave_moe_weights_lane_interleaving(self):
+    """Tests 128-lane interleaving of wi_0 and wi_1 per shard."""
+    lane_size = 128
+    n_shards = 2
+    chunk_size = 2 * lane_size  # 256
+    dim = n_shards * chunk_size  # 512
+    wi_0 = jnp.arange(dim, dtype=jnp.float32).reshape(1, dim)
+    wi_1 = (jnp.arange(dim, dtype=jnp.float32) + 10000.0).reshape(1, dim)
+    tgt_shape = (1, dim * 2)
+
+    interleaved = utils._interleave_moe_weights(
+        wi_0,
+        wi_1,
+        tgt_shape=tgt_shape,
+        n_shards=n_shards,
+        axis=-1,
+        lane_size=lane_size,
+    )
+
+    self.assertEqual(interleaved.shape, tgt_shape)
+    reshaped = interleaved.reshape(1, n_shards, 2, 2, lane_size)
+    np.testing.assert_array_equal(
+        reshaped[0, 0, 0, 0], wi_0[0, :lane_size]
+    )
+    np.testing.assert_array_equal(
+        reshaped[0, 0, 0, 1], wi_1[0, :lane_size]
+    )
+    np.testing.assert_array_equal(
+        reshaped[0, 0, 1, 0], wi_0[0, lane_size : 2 * lane_size]
+    )
+    np.testing.assert_array_equal(
+        reshaped[0, 0, 1, 1], wi_1[0, lane_size : 2 * lane_size]
+    )
+
+  def test_get_default_moe_lane_size(self):
+    self.assertEqual(utils.get_default_moe_lane_size(), 0)
+
+  def test_interleave_moe_weights_fallback_when_lane_size_zero(self):
+    """Verifies standard concatenation when lane_size is 0 (e.g. non-v5p TPU)."""
+    dim = 256
+    wi_0 = jnp.arange(dim, dtype=jnp.float32).reshape(1, dim)
+    wi_1 = (jnp.arange(dim, dtype=jnp.float32) + 1000.0).reshape(1, dim)
+    tgt_shape = (1, dim * 2)
+
+    interleaved = utils._interleave_moe_weights(
+        wi_0,
+        wi_1,
+        tgt_shape=tgt_shape,
+        n_shards=1,
+        axis=-1,
+        lane_size=0,
+    )
+    self.assertEqual(interleaved.shape, tgt_shape)
+    expected = jnp.concatenate([wi_0, wi_1], axis=-1)
+    np.testing.assert_array_equal(interleaved, expected)
+
 
 if __name__ == "__main__":
   absltest.main()
+
